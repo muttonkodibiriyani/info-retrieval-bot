@@ -3,43 +3,38 @@ import io
 import json
 import shutil
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 from typing import List, Tuple
 
 import streamlit as st
 import pandas as pd
 
-# File parsers
 import fitz  # PyMuPDF
 from docx import Document as DocxDocument
 from PIL import Image
 import pytesseract
 
-# PDF export
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 
-# LangChain (NEW SAFE IMPORTS)
+from openai import RateLimitError, APIError, APITimeoutError
+
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document as LCDocument
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
-# -----------------------------
-# Config
-# -----------------------------
 SUPPORTED_EXTS = {
     "pdf", "docx", "xlsx", "xls", "csv", "txt", "json", "xml", "png", "jpg", "jpeg", "webp"
 }
 
+# ---------- UI ----------
 st.set_page_config(page_title="BizChat • Info Retrieval Bot", layout="wide")
 st.title("BizChat • Info Retrieval Bot (Streamlit Cloud Working)")
 
-
-# -----------------------------
-# Utilities
-# -----------------------------
+# ---------- Helpers ----------
 def require_openai_key() -> str:
     key = st.secrets.get("OPENAI_API_KEY", None)
     if not key:
@@ -139,9 +134,10 @@ def file_to_text(filename: str, file_bytes: bytes) -> Tuple[str, str]:
     return "", "unknown"
 
 def chunk_documents(docs: List[LCDocument]) -> List[LCDocument]:
+    # Bigger chunk_size => fewer chunks => fewer embedding calls
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=900,
-        chunk_overlap=150,
+        chunk_size=1600,
+        chunk_overlap=200,
         separators=["\n\n", "\n", " ", ""],
     )
     return splitter.split_documents(docs)
@@ -153,14 +149,12 @@ def build_pdf_bytes(title: str, body: str) -> bytes:
 
     x = 40
     y = height - 60
-
     c.setFont("Helvetica-Bold", 14)
     c.drawString(x, y, title[:120])
     y -= 30
 
     c.setFont("Helvetica", 10)
     max_chars = 100
-
     for para in body.split("\n"):
         while len(para) > max_chars:
             line = para[:max_chars]
@@ -171,13 +165,12 @@ def build_pdf_bytes(title: str, body: str) -> bytes:
                 y = height - 60
             c.drawString(x, y, line)
             y -= 14
-
         if y < 60:
             c.showPage()
             c.setFont("Helvetica", 10)
             y = height - 60
         c.drawString(x, y, para)
-        y -= 20
+        y -= 18
 
     c.save()
     buff.seek(0)
@@ -191,33 +184,52 @@ def format_sources(source_docs: List[LCDocument]) -> str:
         out.append(f"[{i}] {src} — {snippet}...")
     return "\n".join(out).strip()
 
+def build_faiss_with_retries(chunks: List[LCDocument], embeddings: OpenAIEmbeddings, max_retries: int = 6):
+    """
+    Retries FAISS.from_documents when OpenAI rate-limits.
+    Uses exponential backoff.
+    """
+    wait = 2
+    for attempt in range(1, max_retries + 1):
+        try:
+            return FAISS.from_documents(chunks, embeddings)
+        except RateLimitError:
+            if attempt == max_retries:
+                raise
+            st.warning(f"Rate limit hit while embedding. Retrying in {wait}s (attempt {attempt}/{max_retries})...")
+            time.sleep(wait)
+            wait = min(wait * 2, 30)
+        except (APITimeoutError, APIError):
+            if attempt == max_retries:
+                raise
+            st.warning(f"Temporary API error. Retrying in {wait}s (attempt {attempt}/{max_retries})...")
+            time.sleep(wait)
+            wait = min(wait * 2, 30)
 
-# -----------------------------
-# Init session
-# -----------------------------
+# ---------- Session init ----------
 api_key = require_openai_key()
 os.environ["OPENAI_API_KEY"] = api_key
 
 if "temp_dir" not in st.session_state:
     st.session_state.temp_dir = make_temp_dir()
-
 if "raw_docs" not in st.session_state:
     st.session_state.raw_docs = []
-
 if "vectorstore" not in st.session_state:
     st.session_state.vectorstore = None
-
 if "chat" not in st.session_state:
     st.session_state.chat = []
 
-
-# -----------------------------
-# Sidebar
-# -----------------------------
+# ---------- Sidebar ----------
 with st.sidebar:
     st.header("Controls")
     model = st.selectbox("Model", ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o"], index=0)
     temperature = st.slider("Temperature", 0.0, 1.0, 0.2, 0.05)
+
+    st.divider()
+
+    # Safety controls to reduce RateLimit
+    max_chunks = st.number_input("Max chunks to embed (limits cost/limit)", min_value=50, max_value=5000, value=800, step=50)
+    st.caption("If you upload huge PDFs, lower this to avoid RateLimit.")
 
     st.divider()
 
@@ -229,10 +241,7 @@ with st.sidebar:
         st.session_state.temp_dir = make_temp_dir()
         st.success("Cleared.")
 
-
-# -----------------------------
-# Tabs
-# -----------------------------
+# ---------- Tabs ----------
 tab1, tab2 = st.tabs(["Upload / Index", "Chat"])
 
 with tab1:
@@ -249,6 +258,9 @@ with tab1:
         st.markdown("**Optional:** Paste text to include")
         pasted_text = st.text_area("Paste text here", height=160)
 
+        # Basic file size protection
+        st.caption("Tip: If you hit RateLimit, upload fewer files or smaller PDFs, then build index again.")
+
         if st.button("📥 Add to knowledge base", use_container_width=True):
             added, failed = 0, 0
 
@@ -262,6 +274,12 @@ with tab1:
                 for f in uploaded:
                     try:
                         data = f.read()
+                        # hard limit: 15 MB per file to avoid huge embedding cost
+                        if len(data) > 15 * 1024 * 1024:
+                            st.warning(f"Skipped {f.name}: file too large (>15MB).")
+                            failed += 1
+                            continue
+
                         text, src_type = file_to_text(f.name, data)
                         if text and text.strip():
                             out_path = os.path.join(st.session_state.temp_dir, f.name)
@@ -277,7 +295,7 @@ with tab1:
                     except Exception:
                         failed += 1
 
-            st.success(f"Added: {added} item(s). Failed/empty: {failed}.")
+            st.success(f"Added: {added} item(s). Failed/empty/too-big: {failed}.")
 
     with colB:
         st.subheader("2) Build / Rebuild Index (FAISS)")
@@ -287,25 +305,30 @@ with tab1:
             with st.spinner("Chunking + embedding + building index..."):
                 chunks = chunk_documents(st.session_state.raw_docs)
 
-                embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-                st.session_state.vectorstore = FAISS.from_documents(chunks, embeddings)
+                # limit total chunks to avoid hitting rate limits on big uploads
+                if len(chunks) > max_chunks:
+                    st.warning(f"Too many chunks ({len(chunks)}). Limiting to first {max_chunks} chunks to avoid RateLimit.")
+                    chunks = chunks[:max_chunks]
 
-            st.success("Index built successfully ✅")
+                embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+
+                try:
+                    st.session_state.vectorstore = build_faiss_with_retries(chunks, embeddings)
+                    st.success("Index built successfully ✅")
+                except RateLimitError:
+                    st.error(
+                        "RateLimitError from OpenAI while creating embeddings.\n\n"
+                        "What to do:\n"
+                        "1) Wait 1–2 minutes and click Build Index again\n"
+                        "2) Upload fewer/smaller files (or reduce 'Max chunks to embed')\n"
+                        "3) Check your OpenAI billing/quota for this API key\n"
+                    )
 
         st.divider()
         if st.session_state.vectorstore is not None:
             st.info("Index is ready. Go to **Chat** tab.")
         else:
             st.warning("No index yet. Upload docs + build index.")
-
-        st.subheader("Current documents")
-        if st.session_state.raw_docs:
-            for d in st.session_state.raw_docs[:25]:
-                st.write(f"- {d.metadata.get('source','unknown')} ({d.metadata.get('type','')})")
-            if len(st.session_state.raw_docs) > 25:
-                st.caption(f"Showing first 25 of {len(st.session_state.raw_docs)}")
-        else:
-            st.caption("No documents added yet.")
 
 with tab2:
     st.subheader("Ask questions about your uploaded data")
