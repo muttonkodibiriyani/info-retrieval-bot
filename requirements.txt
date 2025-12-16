@@ -6,4 +6,6 @@ PyMuPDF
 pandas
 reportlab
 openpyxl
-python
+python-docx
+pytesseract
+pillow
