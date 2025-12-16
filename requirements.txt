@@ -1,6 +1,8 @@
 streamlit
-langchain==0.1.0
-openai
+openai>=1.0.0
+langchain
+langchain-openai
+langchain-community
 faiss-cpu
 PyMuPDF
 pandas
@@ -9,3 +11,4 @@ openpyxl
 python-docx
 pytesseract
 pillow
+
