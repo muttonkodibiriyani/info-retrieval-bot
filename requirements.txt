@@ -1,0 +1,11 @@
+streamlit
+langchain
+openai
+faiss-cpu
+PyMuPDF
+pandas
+reportlab
+openpyxl
+python-docx
+pytesseract
+pillow
