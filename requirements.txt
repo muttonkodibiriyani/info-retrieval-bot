@@ -1,11 +1,9 @@
 streamlit
-langchain
+langchain==0.1.0
 openai
 faiss-cpu
 PyMuPDF
 pandas
 reportlab
 openpyxl
-python-docx
-pytesseract
-pillow
+python
